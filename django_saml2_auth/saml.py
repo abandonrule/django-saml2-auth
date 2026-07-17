@@ -88,7 +88,7 @@ def validate_metadata_url(url: str) -> bool:
 
 def get_metadata(
     user_id: Optional[str] = None,
-    domain:  Optional[str] = None,
+    domain: Optional[str] = None,
     saml_response: Optional[str] = None,
 ) -> Mapping[str, Any]:
     """Returns metadata information, either by running the GET_METADATA_AUTO_CONF_URLS hook function
@@ -156,6 +156,11 @@ def get_metadata(
             )
 
 
+def get_custom_acs_url() -> Optional[str]:
+    get_custom_acs_url_hook = dictor(settings.SAML2_AUTH, "TRIGGER.GET_CUSTOM_ASSERTION_URL")
+    return run_hook(get_custom_acs_url_hook) if get_custom_acs_url_hook else None
+
+
 def get_saml_client(
     domain: str,
     acs: Callable[..., HttpResponse],
@@ -180,9 +185,6 @@ def get_saml_client(
     Returns:
         Optional[Saml2Client]: A Saml2Client or None
     """
-    # get_reverse raises an exception if the view is not found, so we can safely ignore type errors
-    acs_url = domain + get_reverse([acs, "acs", "django_saml2_auth:acs"])  # type: ignore
-
     get_user_id_from_saml_response = dictor(
         settings.SAML2_AUTH, "TRIGGER.GET_USER_ID_FROM_SAML_RESPONSE"
     )
@@ -203,6 +205,11 @@ def get_saml_client(
                 "status_code": 500,
             },
         )
+
+    acs_url = get_custom_acs_url()
+    if not acs_url:
+        # get_reverse raises an exception if the view is not found, so we can safely ignore type errors
+        acs_url = domain + get_reverse([acs, "acs", "django_saml2_auth:acs"])  # type: ignore
 
     saml2_auth_settings = settings.SAML2_AUTH
 
@@ -231,6 +238,7 @@ def get_saml_client(
                 "want_response_signed": dictor(
                     saml2_auth_settings, "WANT_RESPONSE_SIGNED", default=True
                 ),
+                "force_authn": dictor(saml2_auth_settings, "FORCE_AUTHN", default=False),
             },
         },
     }
@@ -388,11 +396,16 @@ def decode_saml_response(
     return authn_response
 
 
-def extract_user_identity(user_identity: Dict[str, Any]) -> Dict[str, Optional[Any]]:
-    """Extract user information from SAML user identity object
+def extract_user_identity(
+    authn_response: Union[HttpResponseRedirect, Optional[AuthnResponse], None],
+) -> Dict[str, Optional[Any]]:
+    """Extract user information from SAML user identity object and optionally
+    enriches the output with anything that can be extracted from the
+    authentication response, like issuer, name_id, etc.
 
     Args:
-        user_identity (Dict[str, Any]): SAML user identity object (dict)
+        authn_response (Union[HttpResponseRedirect, Optional[AuthnResponse], None]):
+            AuthnResponse object for extracting user identity from.
 
     Raises:
         SAMLAuthError: No token specified.
@@ -400,9 +413,12 @@ def extract_user_identity(user_identity: Dict[str, Any]) -> Dict[str, Optional[A
 
     Returns:
         Dict[str, Optional[Any]]: Cleaned user information plus user_identity
-            for backwards compatibility
+            for backwards compatibility. Also, it can include any custom attributes
+            that are extracted from the SAML response.
     """
     saml2_auth_settings = settings.SAML2_AUTH
+
+    user_identity: Dict[str, Any] = authn_response.get_identity()  # type: ignore
 
     email_field = dictor(saml2_auth_settings, "ATTRIBUTES_MAP.email", default="user.email")
     username_field = dictor(saml2_auth_settings, "ATTRIBUTES_MAP.username", default="user.username")
@@ -454,4 +470,13 @@ def extract_user_identity(user_identity: Dict[str, Any]) -> Dict[str, Optional[A
             },
         )
 
+    # If there is a custom trigger, user identity is extracted directly within the trigger.
+    # This is useful when the user identity doesn't include custom attributes to determine
+    # the organization, project or team that the user belongs to. Hence, the trigger can use
+    # the user identity from the SAML response along with the whole authentication response.
+    extract_user_identity_trigger = dictor(saml2_auth_settings, "TRIGGER.EXTRACT_USER_IDENTITY")
+    if extract_user_identity_trigger:
+        return run_hook(extract_user_identity_trigger, user, authn_response)  # type: ignore
+
+    # If there is no custom trigger, the user identity is returned as is.
     return user

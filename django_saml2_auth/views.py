@@ -18,7 +18,7 @@ from django.template import TemplateDoesNotExist
 try:
     from django.utils.http import url_has_allowed_host_and_scheme as is_safe_url
 except ImportError:
-    from django.utils.http import is_safe_url
+    from django.utils.http import is_safe_url  # type: ignore
 
 from django.views.decorators.csrf import csrf_exempt
 from django_saml2_auth.errors import (
@@ -109,7 +109,7 @@ def acs(request: HttpRequest):
     authn_response = decode_saml_response(request, acs)
     # decode_saml_response() will raise SAMLAuthError if the response is invalid,
     # so we can safely ignore the type check here.
-    user = extract_user_identity(authn_response.get_identity())  # type: ignore
+    user = extract_user_identity(authn_response)  # type: ignore
 
     next_url = request.session.get("login_next_url")
 
@@ -149,21 +149,6 @@ def acs(request: HttpRequest):
 
     request.session.flush()
 
-    use_jwt = dictor(saml2_auth_settings, "USE_JWT", False)
-    if use_jwt and target_user.is_active:
-        # Create a new JWT token for IdP-initiated login (acs)
-        jwt_token = create_custom_or_default_jwt(target_user)
-        custom_token_query_trigger = dictor(saml2_auth_settings, "TRIGGER.CUSTOM_TOKEN_QUERY")
-        if custom_token_query_trigger:
-            query = run_hook(custom_token_query_trigger, jwt_token)
-        else:
-            query = f"?token={jwt_token}"
-
-        # Use JWT auth to send token to frontend
-        frontend_url = dictor(saml2_auth_settings, "FRONTEND_URL", next_url)
-
-        return HttpResponseRedirect(frontend_url + query)
-
     if target_user.is_active:
         # Try to load from the `AUTHENTICATION_BACKENDS` setting in settings.py
         if hasattr(settings, "AUTHENTICATION_BACKENDS") and settings.AUTHENTICATION_BACKENDS:
@@ -186,6 +171,47 @@ def acs(request: HttpRequest):
                 "status_code": 500,
             },
         )
+
+    use_jwt = dictor(saml2_auth_settings, "USE_JWT", False)
+    if use_jwt:
+        # Create a new JWT token for IdP-initiated login (acs)
+        jwt_token = create_custom_or_default_jwt(target_user)
+        custom_token_query_trigger = dictor(saml2_auth_settings, "TRIGGER.CUSTOM_TOKEN_QUERY")
+        query = ""  # Initialize query variable
+        if custom_token_query_trigger:
+            query_result = run_hook(custom_token_query_trigger, jwt_token)
+            query = query_result if query_result is not None else ""
+
+        # Use JWT auth to send token to frontend
+        frontend_url = dictor(saml2_auth_settings, "FRONTEND_URL", next_url)
+        custom_frontend_url_trigger = dictor(saml2_auth_settings, "TRIGGER.GET_CUSTOM_FRONTEND_URL")
+        if custom_frontend_url_trigger:
+            frontend_url = run_hook(custom_frontend_url_trigger, relay_state)  # type: ignore
+
+        # Parse the frontend URL to handle query parameters properly
+        try:
+            parsed_url = urlparse.urlparse(frontend_url)
+            if not custom_token_query_trigger:
+                # Default behavior: add JWT token to existing query parameters
+                existing_query = urlparse.parse_qs(parsed_url.query)
+                existing_query.setdefault("token", []).append(jwt_token)
+                query_string = urlparse.urlencode(existing_query, doseq=True)
+                new_parse = parsed_url._replace(query=query_string)
+                destination_url = urlparse.urlunparse(new_parse)
+            else:
+                # Custom: merge custom query with existing query parameters
+                existing_query = urlparse.parse_qs(parsed_url.query)
+                custom_query = urlparse.parse_qs(query.lstrip("?"))
+                existing_query.update(custom_query)
+                query_string = urlparse.urlencode(existing_query, doseq=True)
+                new_parse = parsed_url._replace(query=query_string)
+                destination_url = urlparse.urlunparse(new_parse)
+        except (ValueError, TypeError):
+            # If URL parsing fails, fall back to simple string concatenation to
+            # maintain backward compatibility with the old behavior
+            destination_url = frontend_url + query
+
+        return HttpResponseRedirect(destination_url)
 
     def redirect(redirect_url: Optional[str] = None) -> HttpResponseRedirect:
         """Redirect to the redirect_url or the root page.
